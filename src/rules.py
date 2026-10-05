@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
@@ -122,6 +124,37 @@ def _validate_zone_admit(actor, entity, data, lookup):
     }
 
 
+def _validate_reservation(actor, data, lookup):
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        raise ValidationError("reservation count must be an integer")
+    if count <= 0:
+        raise ValidationError("reservation count must be positive")
+    expires_at = data.get("expires_at")
+    if not expires_at:
+        raise ValidationError("reservation expires_at is required")
+    try:
+        expires_dt = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError("reservation expires_at must be a valid ISO timestamp")
+    if expires_dt.tzinfo is None:
+        raise ValidationError("reservation expires_at must include timezone")
+    if expires_dt <= datetime.now(timezone.utc):
+        raise ValidationError("reservation expires_at must be in the future")
+    zone = _find_one(lookup, "zone", "id", data.get("zone_id"))
+    if not zone:
+        raise ValidationError("zone does not exist")
+    if zone["status"] not in ("open", "limited"):
+        raise ConflictError("zone is not accepting reservations")
+    gate = _find_one(lookup, "gate", "id", data.get("gate_id"))
+    if not gate or gate["status"] != "open":
+        raise ConflictError("entry gate is not open")
+    if zone["id"] not in (gate["data"].get("zone_ids") or []):
+        raise ValidationError("gate does not serve this zone")
+    return {"operator_id": actor.user_id}
+
+
 def _validate_gate_open(actor, entity, data, lookup):
     for zone_id in entity["data"].get("zone_ids") or []:
         zone = _find_one(lookup, "zone", "id", zone_id)
@@ -155,6 +188,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "reservations": "reservation",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +198,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "reservation": "reserved",
     }
     TRANSITIONS = {
         "venue": {
@@ -209,6 +244,11 @@ class RuleEngine:
             "complete": (("on_scene",), "completed"),
             "cancel": (("draft", "assigned", "enroute", "on_scene"), "cancelled"),
         },
+        "reservation": {
+            "confirm": (("reserved",), "confirmed"),
+            "release": (("reserved",), "released"),
+            "force_release": (("reserved",), "released"),
+        },
     }
     CREATE_REQUIRED = {
         "venue": ("name", "address"),
@@ -218,6 +258,7 @@ class RuleEngine:
         "medical_point": ("venue_id", "zone_id", "capacity", "equipment_level"),
         "incident": ("venue_id", "zone_id", "source_ref", "incident_type", "severity", "reported_at"),
         "task": ("incident_id", "venue_id", "zone_id", "team_id", "task_type"),
+        "reservation": ("zone_id", "gate_id", "count", "expires_at"),
     }
     ACTION_REQUIRED = {
         ("venue", "limit"): ("reason", "capacity_limit"),
@@ -244,6 +285,9 @@ class RuleEngine:
         ("task", "arrive"): ("arrived_at",),
         ("task", "complete"): ("completed_at", "outcome"),
         ("task", "cancel"): ("reason",),
+        ("reservation", "confirm"): (),
+        ("reservation", "release"): (),
+        ("reservation", "force_release"): ("reason",),
     }
     CREATE_ROLES = {
         "venue": ("coordinator", "admin"),
@@ -253,6 +297,7 @@ class RuleEngine:
         "medical_point": ("supervisor", "coordinator", "admin"),
         "incident": ("operator", "supervisor", "coordinator", "admin"),
         "task": ("supervisor", "coordinator", "admin"),
+        "reservation": ("operator", "supervisor", "coordinator", "admin"),
     }
     ROLE_ACTIONS = {
         "limit": ("coordinator", "supervisor", "admin"),
@@ -276,6 +321,9 @@ class RuleEngine:
         "arrive": ("operator", "supervisor", "admin"),
         "complete": ("operator", "supervisor", "admin"),
         "cancel": ("supervisor", "coordinator", "admin"),
+        "confirm": ("operator", "supervisor", "coordinator", "admin"),
+        "release": ("operator",),
+        "force_release": ("coordinator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "venue": _validate_venue,
@@ -285,6 +333,7 @@ class RuleEngine:
         "medical_point": _validate_medical_point,
         "incident": _validate_incident,
         "task": _validate_task,
+        "reservation": _validate_reservation,
     }
     CUSTOM_TRANSITIONS = {
         ("zone", "admit"): _validate_zone_admit,
