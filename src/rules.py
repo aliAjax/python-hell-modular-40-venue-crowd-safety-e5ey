@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
 
 
@@ -6,6 +8,46 @@ def _find_one(lookup, kind, field, value):
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def parse_instant(value, field="expires_at"):
+    if value is None or str(value).strip() == "":
+        raise ValidationError("missing required field: " + field)
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        raise ValidationError(field + " must be an ISO 8601 timestamp")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_instant(moment):
+    return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def active_reserved_count(lookup, zone_id, now):
+    """Sum of pending, unexpired reservation counts for a zone."""
+    if lookup is None:
+        return 0
+    total = 0
+    for row in lookup("reservation", "zone_id", zone_id) or []:
+        if row["status"] != "pending":
+            continue
+        try:
+            expires = parse_instant(row["data"].get("expires_at"))
+        except ValidationError:
+            continue
+        if expires > now:
+            total += int(row["data"].get("count", 0))
+    return total
 
 
 def incident_priority(severity, incident_type):
@@ -109,11 +151,12 @@ def _validate_zone_admit(actor, entity, data, lookup):
         raise ValidationError("gate does not serve this zone")
     occupancy = int(entity["data"].get("current_occupancy", 0))
     capacity = int(entity["data"].get("capacity", 0))
-    if not capacity_available(capacity, occupancy, count):
+    reserved = active_reserved_count(lookup, entity["id"], now_utc())
+    if not capacity_available(capacity, occupancy + reserved, count):
         raise ConflictError("zone capacity would be exceeded")
     if entity["status"] == "limited":
         limit = int(entity["data"].get("admit_limit", capacity))
-        if occupancy + count > limit:
+        if occupancy + reserved + count > limit:
             raise ConflictError("zone admission limit would be exceeded")
     return {
         "current_occupancy": occupancy + count,
@@ -146,6 +189,100 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+RESERVATION_CREATE_ROLES = ("operator", "supervisor", "admin")
+RESERVATION_CONFIRM_ROLES = ("operator", "supervisor", "admin")
+RESERVATION_FORCE_CANCEL_ROLES = ("supervisor", "coordinator", "admin")
+ZONE_CAPACITY_ROLES = ("coordinator", "admin")
+
+
+def _operator_owns_gate(actor, gate, reservation=None):
+    operator_id = (gate or {}).get("data", {}).get("operator_id")
+    if operator_id and operator_id == actor.user_id:
+        return True
+    return bool(reservation) and reservation.get("created_by") == actor.user_id
+
+
+def validate_reservation_create(actor, zone, gate, data, active_reserved, now):
+    if actor.role not in RESERVATION_CREATE_ROLES:
+        raise PermissionDenied("role %s is not allowed here" % actor.role)
+    for field in ("gate_id", "count", "expires_at"):
+        value = data.get(field)
+        if value is None or value == "":
+            raise ValidationError("missing required field: " + field)
+    if zone["status"] not in ("open", "limited"):
+        raise ConflictError("zone is not open for reservations")
+    if not gate or gate["kind"] != "gate":
+        raise ValidationError("gate does not exist")
+    if gate["status"] != "open":
+        raise ConflictError("entry gate is not open")
+    if zone["id"] not in (gate["data"].get("zone_ids") or []):
+        raise ValidationError("gate does not serve this zone")
+    if actor.role == "operator" and not _operator_owns_gate(actor, gate):
+        raise PermissionDenied("operator can only manage their own gate")
+    try:
+        count = int(data.get("count"))
+    except (TypeError, ValueError):
+        raise ValidationError("reservation count must be an integer")
+    if count <= 0:
+        raise ValidationError("reservation count must be positive")
+    expires = parse_instant(data.get("expires_at"))
+    if expires <= now:
+        raise ValidationError("expires_at must be in the future")
+    capacity = int(zone["data"].get("capacity", 0))
+    occupancy = int(zone["data"].get("current_occupancy", 0))
+    limit = capacity
+    if zone["status"] == "limited":
+        limit = min(limit, int(zone["data"].get("admit_limit", capacity)))
+    if occupancy + active_reserved + count > limit:
+        raise ConflictError("zone capacity would be exceeded")
+    return {
+        "count": count,
+        "expires_at": format_instant(expires),
+        "venue_id": zone["data"].get("venue_id"),
+        "zone_id": zone["id"],
+        "gate_id": gate["id"],
+    }
+
+
+def validate_reservation_confirm(actor, reservation, zone, gate, now):
+    if actor.role not in RESERVATION_CONFIRM_ROLES:
+        raise PermissionDenied("role %s is not allowed here" % actor.role)
+    if actor.role == "operator" and not _operator_owns_gate(actor, gate, reservation):
+        raise PermissionDenied("operator can only manage their own gate")
+    if not zone or zone["status"] not in ("open", "limited"):
+        raise ConflictError("zone is not open for confirmation")
+    if parse_instant(reservation["data"].get("expires_at")) <= now:
+        raise ConflictError("reservation has expired")
+
+
+def validate_reservation_cancel(actor, reservation, gate, data):
+    if actor.role == "operator":
+        if not _operator_owns_gate(actor, gate, reservation):
+            raise PermissionDenied("operator can only cancel reservations for their own gate")
+        return "released", {
+            "release_reason": str(data.get("reason") or ""),
+            "released_by": actor.user_id,
+        }
+    if actor.role in RESERVATION_FORCE_CANCEL_ROLES:
+        reason = str(data.get("reason") or "").strip()
+        if not reason:
+            raise ValidationError("reason is required for forced revocation")
+        return "revoked", {"revoke_reason": reason, "revoked_by": actor.user_id}
+    raise PermissionDenied("role %s is not allowed here" % actor.role)
+
+
+def validate_zone_capacity_change(actor, capacity_value):
+    if actor.role not in ZONE_CAPACITY_ROLES:
+        raise PermissionDenied("role %s is not allowed here" % actor.role)
+    try:
+        capacity = int(capacity_value)
+    except (TypeError, ValueError):
+        raise ValidationError("capacity must be an integer")
+    if capacity <= 0:
+        raise ValidationError("zone capacity must be positive")
+    return capacity
+
+
 class RuleEngine:
     ALIASES = {
         "venues": "venue",
@@ -155,6 +292,7 @@ class RuleEngine:
         "medical_points": "medical_point",
         "incidents": "incident",
         "tasks": "task",
+        "reservations": "reservation",
     }
     INITIAL_STATUS = {
         "venue": "ready",
@@ -164,6 +302,7 @@ class RuleEngine:
         "medical_point": "standby",
         "incident": "reported",
         "task": "draft",
+        "reservation": "pending",
     }
     TRANSITIONS = {
         "venue": {

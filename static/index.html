@@ -20,7 +20,9 @@
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
-POST /api/entities/&lt;id&gt;/actions
+POST /api/reservations        区域入场配额预占（zone_id, gate_id, count, expires_at）
+POST /api/entities/&lt;id&gt;/actions  confirm / cancel / set_capacity
+GET  /api/entities/&lt;zone_id&gt;  区域详情附 quota：占用、预占、剩余三者对得上
 GET  /api/audit</pre>
 </main>
 <script>
